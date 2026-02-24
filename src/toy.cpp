@@ -1,3 +1,7 @@
+#include "../include/KaleidoscopeJIT.h"
+#include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
+using llvm::cantFail;
+using llvm::orc::SymbolStringPtr;
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -7,8 +11,20 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include <cassert>
+#include <cstdint>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +38,7 @@
 
 
 using namespace llvm;
+using namespace llvm::orc;
 
 //LEXER
 
@@ -174,6 +191,7 @@ public:
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
   Function *codegen();
+  const std::string &getName() const { return Proto->getName(); }
 };
 
 }
@@ -371,9 +389,35 @@ static std::unique_ptr<LLVMContext> TheContext; //obj owning core LLVM data stru
 static std::unique_ptr<IRBuilder<>> Builder; //helper obj to generate LLVM instructions; keeps track of current place to insert instructions and has methods to create new instructions
 static std::unique_ptr<Module> TheModule; //contains fxns and globals vars; owns memory for all generated IR
 static std::map<std::string, Value *> NamedValues; //tracks values defined in current scope and their LLVM representation; symbol table for code
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static std::map<std::string, llvm::orc::ResourceTrackerSP> FunctionTrackers;
+static ExitOnError ExitOnErr;
+
 
 Value *LogErrorV(const char *Str) {
   LogError(Str);
+  return nullptr;
+}
+
+
+Function *getFunction(std::string Name) {
+  //checking if fxn has already been added to the current module
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  //returning null if no prototype exists
   return nullptr;
 }
 
@@ -388,7 +432,7 @@ Value *VariableExprAST::codegen() {
   //Look up the variable in the fxn
   Value *V = NamedValues[Name];
   if (!V)
-    LogErrorV("Unknown variable name.");
+    return LogErrorV("Unknown variable name.");
   return V;
   //merely checks whether the specified name is in the NamedValues map, assuming the variable has already been emitted somewhere with its value available
   //in practice, only fxn args can be in the NV map
@@ -420,7 +464,8 @@ Value *BinaryExprAST::codegen() {
 
 Value *CallExprAST::codegen() {
   //looking up call name in the global module table
-  Function *CalleeF = TheModule->getFunction(Callee);
+  Function *CalleeF = getFunction(Callee);
+  //Function *CalleeF = TheModule->getFunction(Callee);
   if(!CalleeF)
     return LogErrorV("Unknown function referenced");
 
@@ -437,93 +482,167 @@ Value *CallExprAST::codegen() {
   return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
+// Function *PrototypeAST::codegen() {
+//   //fxn type like: double(double, double) ??
+//   std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext)); //creates a vector of 'n' double types
+//   FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false); //uses the 'n' double args to give one double result
+//   Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get()); //user specified fxn name registered in 'Module' symbol table
+//   //returns the LLVM Function, and not the LLVM "Value" computed by the said fxn.
+
+//   unsigned Idx = 0;
+//   for (auto &Arg : F->args())
+//     Arg.setName(Args[Idx++]);
+//   //setting fxn args acc. to. prototype names
+
+//   return F;
+// }
+
 Function *PrototypeAST::codegen() {
-  //fxn type like: double(double, double) ??
-  std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext)); //creates a vector of 'n' double types
-  FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false); //uses the 'n' double args to give one double result
-  Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get()); //user specified fxn name registered in 'Module' symbol table
-  //returns the LLVM Function, and not the LLVM "Value" computed by the said fxn.
+  std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
 
   unsigned Idx = 0;
   for (auto &Arg : F->args())
     Arg.setName(Args[Idx++]);
-  //setting fxn args acc. to. prototype names
-
   return F;
 }
 
+
 Function *FunctionAST::codegen() {
-  //check for an existing fxn from a previous extern declaration
-  //checking whether or not body is empty before codegen-ing one.
-  Function *TheFunction = TheModule->getFunction(Proto->getName());
+  std::string Name = Proto->getName();
+  FunctionProtos[Name] = std::move(Proto);  // Store FIRST
 
-  if (!TheFunction)
-    TheFunction = Proto->codegen();
+  Function *TheFunction = getFunction(Name);
+  if (!TheFunction) return nullptr;
 
-  if (!TheFunction)
-    return nullptr;
+  if (TheFunction->arg_size() != FunctionProtos[Name]->getArgs().size()) {
+    return (Function*)LogErrorV("Arity mismatch");
+  }
 
-  //-----EXTRA-----
-  //checking if fxn args match prototype args
-  //definition has to take precedence and not prototype
-  if (TheFunction->getName() == Proto->getName()) {
-    unsigned Idx = 0;
-    //check args size
-    if (TheFunction->arg_size() != Proto->getArgs().size()) {
-     return (Function*)LogErrorV("Arity mismatch: Redefinition with wrong number of arguments.");
-    }
-    //renaming args of the existing LLVM fxn (TheFunction)
-    for (auto &Arg : TheFunction->args()) {
-      Arg.setName(Proto->getArgs()[Idx++]);
-    }
+  // Name args
+  unsigned Idx = 0;
+  for (auto &Arg : TheFunction->args()) {
+    Arg.setName(FunctionProtos[Name]->getArgs()[Idx++]);
   }
 
   if (!TheFunction->empty())
     return (Function*)LogErrorV("Function cannot be redefined.");
-  //-----EXTRA-----
 
+  // BUILD FUNCTION BODY
   BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
-  Builder->SetInsertPoint(BB); //New basic block to start insertion into
-
+  Builder->SetInsertPoint(BB);
   NamedValues.clear();
-  for(auto &Arg : TheFunction->args())
-    NamedValues[std::string(Arg.getName())] = &Arg; //add fxn args to NV map so they're available to the VariableExprAST nodes
+  for (auto &Arg : TheFunction->args())
+    NamedValues[std::string(Arg.getName())] = &Arg;
 
   if (Value *RetVal = Body->codegen()) {
-    Builder->CreateRet(RetVal); //finish the fxn //returns computed value from codegen() if no errors
-    verifyFunction(*TheFunction); //for consistency czhecks on generated code; IMPORTANT!
+    Builder->CreateRet(RetVal);
+    verifyFunction(*TheFunction);
+    TheFPM->run(*TheFunction, *TheFAM);
     return TheFunction;
   }
 
   TheFunction->eraseFromParent();
-  return nullptr; //if user errs in typing, they can redefine later, bcs we delete the produced fxn
-                  //else, can't redefine bcs it would live in the symbol table w a body
+  return nullptr;
 }
+
+
 
 
 //DISPLAYING WHAT'S BEEN PARSED; JIT DRIVER
 
-static void InitialiseModule() {
-  TheContext = std::make_unique<LLVMContext>();
-  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+// static void InitialiseModule() {
+//   TheContext = std::make_unique<LLVMContext>();
+//   TheModule = std::make_unique<Module>("my cool jit", *TheContext);
 
-  //new builder for the module
+//   //new builder for the module
+//   Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+// }
+
+void InitialiseModuleAndManagers(void) {
+  //New context and module
+  TheContext = std::make_unique<LLVMContext>();
+  TheModule = std::make_unique<Module>("KaleidoscopeJIT", *TheContext);
+  if (TheJIT)
+    TheModule->setDataLayout(TheJIT->getDataLayout());
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+  //New builder for the module
+  TheFPM = std::make_unique<FunctionPassManager>();
+  TheLAM = std::make_unique<LoopAnalysisManager>();
+  TheFAM = std::make_unique<FunctionAnalysisManager>();
+  TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+  TheMAM = std::make_unique<ModuleAnalysisManager>();
+  ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+  TheSI = std::make_unique<StandardInstrumentations>(*TheContext, /*DebugLogging*/ true);
+  TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+
+  //TRANSFORM PASSES
+  //Peephole, bit-twiddling optimisations; standard cleanup optimisations useful for wide variety of code
+  TheFPM->addPass(InstCombinePass());
+  //Reassociate expressions
+  TheFPM->addPass(ReassociatePass());
+  //Eliminate common subexp
+  TheFPM->addPass(GVNPass());
+  //Simplify CFG (deleting unreachable blocks, etc.)
+  TheFPM->addPass(SimplifyCFGPass());
+
+  //ANALYSIS PASSES for above transform passes
+  PassBuilder PB;
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 
 }
 
+
+// static void HandleDefinition() {
+//   if (auto FnAST = ParseDefinition()) {
+//     if (auto *FnIR = FnAST->codegen()) {
+//       fprintf(stderr, "Read function definition: ");
+//       FnIR->print(errs());
+//       fprintf(stderr, "\n");
+//       ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+//       InitialiseModuleAndManagers();
+//     }
+//   }
+//   else {
+//     getNextToken();
+//   }
+// }
+
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
+    std::string FnName = FnAST->getName();
+
     if (auto *FnIR = FnAST->codegen()) {
       fprintf(stderr, "Read function definition: ");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+
+      // Remove old definition if it exists
+      if (FunctionTrackers.count(FnName)) {
+        ExitOnErr(FunctionTrackers[FnName]->remove());
+        FunctionTrackers.erase(FnName);
+      }
+
+      // Add new definition with its own tracker
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      FunctionTrackers[FnName] = RT;  // store for potential future redefinition
+
+      InitialiseModuleAndManagers();
     }
-  }
-  else {
+  } else {
     getNextToken();
   }
 }
+
+
 
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
@@ -531,6 +650,7 @@ static void HandleExtern() {
       fprintf(stderr, "Read extern: ");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   }
   else {
@@ -538,20 +658,58 @@ static void HandleExtern() {
   }
 }
 
+// static void HandleTopLevelExpression() {
+//   if (auto FnAST = ParseTopLevelExpr()) {
+//     if (auto *FnIR = FnAST->codegen()) {
+//       fprintf(stderr, "Read top-level expression: ");
+//       FnIR->print(errs());
+//       fprintf(stderr, "\n");
+
+//       //Remove the anon expression.
+//       FnIR->eraseFromParent();
+//     }
+//   } else {
+//     getNextToken();
+//   }
+// }
+
 static void HandleTopLevelExpression() {
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression: ");
+      fprintf(stderr, "Read top-level expression:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
 
-      //Remove the anon expression.
-      FnIR->eraseFromParent();
+      // Use resource tracker for module lifetime control
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      // Move current module/context to JIT
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+
+      // Reset for next expression
+      InitialiseModuleAndManagers();
+
+      // Lookup & execute - LLVM 21/KaleidoscopeJIT compatible
+      auto ExprSymbol = TheJIT->lookup("__anon_expr");
+      if (ExprSymbol) {
+        uintptr_t Addr = ExprSymbol->getAddress().getValue();
+        double (*FP)() = reinterpret_cast<double(*)()>(Addr);
+        fprintf(stderr, "Evaluated to %f\n", FP());
+      } else {
+        fprintf(stderr, "JIT lookup failed for __anon_expr\n");
+      }
+
+      // Cleanup JIT memory
+      ExitOnErr(RT->remove());
     }
   } else {
-    getNextToken();
+    getNextToken();  // Skip bad input
   }
 }
+
+
+
 
 //MAIN
 
@@ -579,6 +737,11 @@ static void MainLoop() {
 }
 
 int main() {
+
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   //increasing precedence
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
@@ -588,12 +751,16 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  InitialiseModule();
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+  InitialiseModuleAndManagers();
+
+
+  //InitialiseModule();
 
   //for the interpreter
   MainLoop();
 
-  TheModule->print(errs(), nullptr);
+  //TheModule->print(errs(), nullptr);
 
   return 0;
 }
