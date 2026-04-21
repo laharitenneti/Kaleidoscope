@@ -8,6 +8,7 @@ using llvm::orc::SymbolStringPtr;
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -52,7 +53,14 @@ enum Token {
 
   // primary
   tok_identifier = -4,
-  tok_number = -5
+  tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10
 };
 
 static std::string IdentifierStr;
@@ -75,6 +83,16 @@ static int gettok() {
       return tok_def;
     if (IdentifierStr == "extern")
       return tok_extern;
+    if (IdentifierStr == "if")
+      return tok_if;
+    if (IdentifierStr == "then")
+      return tok_then;
+    if (IdentifierStr == "else")
+      return tok_else;
+    if (IdentifierStr == "for")
+      return tok_for;
+    if (IdentifierStr == "in")
+      return tok_in;
     return tok_identifier;
   }
 
@@ -175,6 +193,7 @@ public:
 
   const std::string &getName() const { return Name; }
 
+  //!EXTRA!
   //getting args so we can compare prototype and definition args
   //even if there's a mismatch, codegen won't be hindered
   //bcs we rename the prototype's args to match the definition's
@@ -191,7 +210,24 @@ public:
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
   Function *codegen();
-  const std::string &getName() const { return Proto->getName(); }
+  const std::string &getName() const { return Proto->getName(); } //to seek a FunctionAST's name directly, without having to reach through the prototype.
+};
+
+//Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr<ExprAST> Cond, Then, Else;
+public:
+  IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then, std::unique_ptr<ExprAST> Else) : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+  Value *codegen() override;
+};
+
+//expression class for 'for' and 'in'
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start, End, Step, Body;
+
+public: ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start, std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step, std::unique_ptr<ExprAST> Body): VarName(VarName), Start(std::move(Start)), End(std::move(End)), Step(std::move(Step)), Body(std::move(Body)) {}
+  Value *codegen() override;
 };
 
 }
@@ -279,6 +315,78 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+//parsing if-then-else expressions
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken(); //consuming 'if'
+
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError("The keyword 'then' is expected.");
+  getNextToken(); //consuming 'then'
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError("They keyword 'else' is expected.");
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
+}
+
+//parsing for expressions
+static std::unique_ptr<ExprAST> ParseForExpr() {
+  getNextToken();
+
+  if (CurTok != tok_identifier)
+    return LogError("An identifier is expected after 'for'");
+
+  std::string IdName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != '=')
+    return LogError("A '=' is expected after 'for.'");
+  getNextToken();
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != ',')
+    return LogError("A ',' is expected after the 'for' start value.");
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  //step value is optional
+  std::unique_ptr<ExprAST> Step;
+  if (CurTok == ',') {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError("An 'in' is expected after 'for'");
+  getNextToken();
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
+}
+
 //primary
 static std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
@@ -290,6 +398,10 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
   }
 }
 
@@ -482,20 +594,123 @@ Value *CallExprAST::codegen() {
   return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
-// Function *PrototypeAST::codegen() {
-//   //fxn type like: double(double, double) ??
-//   std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext)); //creates a vector of 'n' double types
-//   FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false); //uses the 'n' double args to give one double result
-//   Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get()); //user specified fxn name registered in 'Module' symbol table
-//   //returns the LLVM Function, and not the LLVM "Value" computed by the said fxn.
+Value *IfExprAST::codegen() {
+  Value *CondV = Cond->codegen();
+  if (!CondV)
+    return nullptr;
 
-//   unsigned Idx = 0;
-//   for (auto &Arg : F->args())
-//     Arg.setName(Args[Idx++]);
-//   //setting fxn args acc. to. prototype names
+  //the condition is converted to a boolean to compare a non-equal to 0.0
+  CondV = Builder->CreateFCmpONE(CondV, ConstantFP::get(*TheContext, APFloat(0.0)), "ifcond");
+  Function *TheFunction = Builder->GetInsertBlock()->getParent();
+  BasicBlock *ThenBB = BasicBlock::Create(*TheContext, "then", TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(*TheContext, "else");
+  BasicBlock *MergeBB = BasicBlock::Create(*TheContext, "ifcont");
+  Builder->CreateCondBr(CondV, ThenBB, ElseBB);
 
-//   return F;
-// }
+  //Emitting 'then' value
+  Builder->SetInsertPoint(ThenBB);
+  Value *ThenV = Then->codegen();
+
+  if (!ThenV)
+    return nullptr;
+
+  Builder->CreateBr(MergeBB);
+  //'Then's codegen can change the current block, so update ThenBB for the Phi.
+  ThenBB = Builder->GetInsertBlock();
+
+  //Emitting the 'else' block
+  TheFunction->insert(TheFunction->end(), ElseBB);
+  Builder->SetInsertPoint(ElseBB);
+
+  Value *ElseV = Else->codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder->CreateBr(MergeBB);
+  //like 'then's codegen changing the current block, else's codegen can too; so update ElseBB for the Phi.
+  ElseBB = Builder->GetInsertBlock();
+
+  //Emitting the merge block.
+  TheFunction->insert(TheFunction->end(), MergeBB);
+  Builder->SetInsertPoint(MergeBB);
+  PHINode *PN = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+Value *ForExprAST::codegen() {
+  //Emitting start code first, without 'variable' in scope
+  Value *StartVal = Start->codegen();
+  if (!StartVal)
+    return nullptr;
+
+  //basic block for loop header, inserted after current block
+  Function *TheFunction = Builder->GetInsertBlock()->getParent();
+  BasicBlock *PreheaderBB = Builder->GetInsertBlock();
+  BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
+
+  //explicitly specifying the "fall-through" (natural sequence of where to go next), from current block to LoopBB
+  Builder->CreateBr(LoopBB);
+
+  //insertion into LoopBB
+  Builder->SetInsertPoint(LoopBB);
+
+  //starting the PHI node w an entry for Start
+  PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
+  Variable->addIncoming(StartVal, PreheaderBB);
+
+  //the variable is defined equal to the PHI node inside the loop. Any existing variable it shadows has to be restored, and hence is saved now.
+  Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  //Emitting the loop's body, which can (like o exprs) modify the basic block.
+  if (!Body->codegen())
+    return nullptr;
+
+  //Emitting the step value
+  Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step->codegen();
+    if (!StepVal)
+      return nullptr;
+  }
+  else {
+    StepVal = ConstantFP::get(*TheContext, APFloat(1.0)); //using 1.0 if not specified
+  }
+  Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
+
+  //Computing the end condition.
+  Value *EndCond = End->codegen();
+  if (!EndCond)
+    return nullptr;
+
+  //Condition is converted to a bool by comparing non-equal to 0.0
+  EndCond = Builder->CreateFCmpONE(EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+  //Creating the "after loop" block and inserting it
+  BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+  BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+  //Inserting the conditional branch into the end of LoopEndBB
+  Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  //Any new code will be inserted in AfterBB.
+  Builder->SetInsertPoint(AfterBB);
+
+  //New entry to the PHI node.
+  Variable->addIncoming(NextVar, LoopEndBB);
+
+  //Restoring the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  //a 'for' expression always returns 0.0
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
 
 Function *PrototypeAST::codegen() {
   std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
@@ -510,7 +725,7 @@ Function *PrototypeAST::codegen() {
 }
 
 
-Function *FunctionAST::codegen() {
+Function *FunctionAST::codegen() { //performs checks for arity, redefinition of existing fxns, etc.
   std::string Name = Proto->getName();
   FunctionProtos[Name] = std::move(Proto);  // Store FIRST
 
@@ -553,15 +768,6 @@ Function *FunctionAST::codegen() {
 
 //DISPLAYING WHAT'S BEEN PARSED; JIT DRIVER
 
-// static void InitialiseModule() {
-//   TheContext = std::make_unique<LLVMContext>();
-//   TheModule = std::make_unique<Module>("my cool jit", *TheContext);
-
-//   //new builder for the module
-//   Builder = std::make_unique<IRBuilder<>>(*TheContext);
-
-// }
-
 void InitialiseModuleAndManagers(void) {
   //New context and module
   TheContext = std::make_unique<LLVMContext>();
@@ -597,22 +803,6 @@ void InitialiseModuleAndManagers(void) {
   PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 
 }
-
-
-// static void HandleDefinition() {
-//   if (auto FnAST = ParseDefinition()) {
-//     if (auto *FnIR = FnAST->codegen()) {
-//       fprintf(stderr, "Read function definition: ");
-//       FnIR->print(errs());
-//       fprintf(stderr, "\n");
-//       ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
-//       InitialiseModuleAndManagers();
-//     }
-//   }
-//   else {
-//     getNextToken();
-//   }
-// }
 
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
@@ -657,21 +847,6 @@ static void HandleExtern() {
     getNextToken();
   }
 }
-
-// static void HandleTopLevelExpression() {
-//   if (auto FnAST = ParseTopLevelExpr()) {
-//     if (auto *FnIR = FnAST->codegen()) {
-//       fprintf(stderr, "Read top-level expression: ");
-//       FnIR->print(errs());
-//       fprintf(stderr, "\n");
-
-//       //Remove the anon expression.
-//       FnIR->eraseFromParent();
-//     }
-//   } else {
-//     getNextToken();
-//   }
-// }
 
 static void HandleTopLevelExpression() {
   if (auto FnAST = ParseTopLevelExpr()) {
