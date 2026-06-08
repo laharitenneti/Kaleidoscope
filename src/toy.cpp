@@ -10,21 +10,28 @@ using llvm::orc::SymbolStringPtr;
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/Reassociate.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <cassert>
 #include <cstdint>
 #include <cctype>
@@ -33,6 +40,7 @@ using llvm::orc::SymbolStringPtr;
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 #include <algorithm>
@@ -40,6 +48,7 @@ using llvm::orc::SymbolStringPtr;
 
 
 using namespace llvm;
+using namespace llvm::sys;
 using namespace llvm::orc;
 
 //LEXER
@@ -321,7 +330,7 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
     std::string Name = IdentifierStr;
     getNextToken();
 
-    std::unique_ptr<ExprAST> Init;
+    std::unique_ptr<ExprAST> Init = nullptr;
     if (CurTok == '=') {
       getNextToken();
 
@@ -1060,17 +1069,40 @@ static void HandleDefinition() {
       FnIR->print(errs());
       fprintf(stderr, "\n");
 
-      // Remove old definition if it exists
+      //AOT Emit, before JIT takes over the module
+      {
+        auto TargetTriple = sys::getDefaultTargetTriple();
+        TheModule->setTargetTriple(Triple(TargetTriple));
+
+        std::string Error;
+        auto Target = TargetRegistry::lookupTarget(TheModule->getTargetTriple(), Error);
+        if (Target) {
+          TargetOptions opt;
+          auto TM = Target->createTargetMachine(
+              Triple(TargetTriple), "generic", "", opt, Reloc::PIC_);
+          TheModule->setDataLayout(TM->createDataLayout());
+
+          std::error_code EC;
+          raw_fd_ostream dest("output.o", EC, sys::fs::OF_None);
+          if (!EC) {
+            legacy::PassManager pass;
+            TM->addPassesToEmitFile(pass, dest, nullptr, CodeGenFileType::ObjectFile);
+            pass.run(*TheModule);
+            dest.flush();
+            fprintf(stderr, "Wrote output.o\n");
+          }
+        }
+      }
+
       if (FunctionTrackers.count(FnName)) {
         ExitOnErr(FunctionTrackers[FnName]->remove());
         FunctionTrackers.erase(FnName);
       }
 
-      // Add new definition with its own tracker
       auto RT = TheJIT->getMainJITDylib().createResourceTracker();
       auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
       ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-      FunctionTrackers[FnName] = RT;  // store for potential future redefinition
+      FunctionTrackers[FnName] = RT;
 
       InitialiseModuleAndManagers();
     }
@@ -1078,8 +1110,6 @@ static void HandleDefinition() {
     getNextToken();
   }
 }
-
-
 
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
@@ -1160,13 +1190,17 @@ int main() {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
   InitializeNativeTargetAsmParser();
+  InitializeAllTargetInfos();
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmParsers();
+  InitializeAllAsmPrinters();
 
-  //increasing precedence
   BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
-  BinopPrecedence['*'] = 40; // highest
+  BinopPrecedence['*'] = 40;
 
   fprintf(stderr, "ready> ");
   getNextToken();
@@ -1174,13 +1208,7 @@ int main() {
   TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
   InitialiseModuleAndManagers();
 
-
-  //InitialiseModule();
-
-  //for the interpreter
   MainLoop();
-
-  //TheModule->print(errs(), nullptr);
 
   return 0;
 }
