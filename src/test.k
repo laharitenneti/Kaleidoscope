@@ -1,0 +1,1 @@
+def celsius(fahrenheit) var result = (fahrenheit - 32.0) * 0.555556 in result
